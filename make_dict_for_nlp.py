@@ -6,12 +6,12 @@ with zipfile.ZipFile('./data/jaychou_lyrics.txt.zip') as zin:
 print(corpus_chars[:40])
 corpus_chars = corpus_chars.replace('\n', ' ').replace('\r', ' ')
 corpus_chars = corpus_chars[0:10000]
-
+#用于从原始语料构造字典
 idx_to_char = list(set(corpus_chars))
 char_to_idx = dict([(char, i) for i, char in enumerate(idx_to_char)])
 vocab_size = len(char_to_idx)
 print(vocab_size)
-
+#一旦生成字典，便可以将原始语料进行编码
 corpus_indices = [char_to_idx[char] for char in corpus_chars]
 sample = corpus_indices[:20]
 print('chars:', ''.join([idx_to_char[idx] for idx in sample]))
