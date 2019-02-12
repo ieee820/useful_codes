@@ -6,3 +6,6 @@ ls ./*.jpg | sort -u | uniq | wc -l
 cat ../pre_100.txt | xargs mv -t /d/pre_100_test/
 cat ../pre_100.txt | xargs rm -rf 
 cat ../pre_100.txt | xargs cp -t /d/pre_100_test/
+#同样适用用find
+find ./ -iname 'AAH_*.png' | xargs cp -t ../renji20181228_checked/AAH/
+
