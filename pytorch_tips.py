@@ -15,3 +15,9 @@ self.dict = {}
 for i, char in enumerate(alphabet):
     # NOTE: 0 is reserved for 'blank' required by wrap_ctc
     self.dict[char] = i + 1
+    
+#绘制网络结构，并保存为pdf
+out_HR = net(net_input)
+dot = make_dot(out_HR, params=dict(net.named_parameters()))
+dot.render(filename='./net')
+
