@@ -1,5 +1,5 @@
 imort datetime
-
+#统计运行time时间，单位是ms
 s_time = datetime.datetime.now()
 y = cupy.arange(2048, dtype=float)
 cupy.fft.fft(y)
