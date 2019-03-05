@@ -46,5 +46,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # PyTorch 
 model = Net().to(device)
 #有些情况不用输入第一个维度
 summary(model, (1, 28, 28))
-#
+
+#将numpy转换为torch tensor，并且HWC to CHW
+img_HR = torch.from_numpy(np.ascontiguousarray(np.transpose(img_HR, (2, 0, 1)))).float()
+
 
