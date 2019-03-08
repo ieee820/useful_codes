@@ -1,3 +1,9 @@
+#在for循环推断中，将GPU中的tensor清理掉
+del inputs, labels, outputs, preds #这些都是GPU中的变量
+torch.cuda.empty_cache()
+
+
+
 # 测试网络,获得输出的feature map:
 m = nn.Linear(20, 30)
 input = torch.randn(128, 20)
