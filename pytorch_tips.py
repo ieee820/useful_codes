@@ -2,7 +2,8 @@
 del inputs, labels, outputs, preds #这些都是GPU中的变量
 torch.cuda.empty_cache()
 
-
+#另一种获得模型权重的方法：
+best_model_wts = copy.deepcopy(vgg.state_dict())  #vgg是初始化好的model
 
 # 测试网络,获得输出的feature map:
 m = nn.Linear(20, 30)
