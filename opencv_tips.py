@@ -1,3 +1,9 @@
+# 使用ostu自动检测图像Binarization的阈值
+image1 = cv2.imread("HITACHI-part+250.png")
+(ori_h,ori_w,c) = image1.shape
+gray1 = cv2.cvtColor(image1, cv2.COLOR_BGR2GRAY)
+ret1,th1 = cv2.threshold(gray1, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU) #因为此处自动选择阈值，所以参数设置为0，255就行
+  
   #将大图分割成小图  
     img_name = os.path.basename(path)
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
