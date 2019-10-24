@@ -8,4 +8,5 @@ cat ../pre_100.txt | xargs rm -rf
 cat ../pre_100.txt | xargs cp -t /d/pre_100_test/
 #同样适用用find
 find ./ -iname 'AAH_*.png' | xargs cp -t ../renji20181228_checked/AAH/
-
+#使用！符号过滤掉不含有slice字样的图片
+find ./ !  -iname '*slice*.png'
