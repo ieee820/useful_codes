@@ -99,3 +99,26 @@ ret1,th1 = cv2.threshold(gray1, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU) #
     else:
         rlt /= 255.
     return rlt.astype(in_img_type)
+  
+  
+#使用mask来在原图上画出轮廓区域
+import cv2
+import numpy as np
+
+bg = cv2.imread('./img_0213_i.png', cv2.IMREAD_GRAYSCALE)
+backtorgb = cv2.cvtColor(bg,cv2.COLOR_GRAY2RGB)
+# cv2.imwrite('./out.png', backtorgb)
+mask = cv2.imread('./img_0213_p.png', cv2.IMREAD_GRAYSCALE)
+mask = (mask >= 200)
+# print(mask)
+roi = backtorgb
+roi = roi[mask]
+# print(roi.shape)
+c = '0,0,255'
+COLORS = np.array(c.split(",")).astype("int")
+COLORS = np.array(COLORS, dtype="uint8")
+# color = (0,255,0)
+blended = ((0.1 * COLORS) + (0.9 * roi)).astype("uint8")
+print(blended)
+backtorgb[mask] = blended
+cv2.imwrite('./out.png', backtorgb)
