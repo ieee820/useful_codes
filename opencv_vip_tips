@@ -1,0 +1,885 @@
+import settings
+import helpers
+import cv2
+import math
+import os
+import glob
+import numpy
+import dicom
+from tqdm import tqdm
+import time
+from gpu_util import get_model,get_model_new
+from dicom_util import is_dicom_file, trans_dicom_avm, get_pixels_hu_by_simpleitk, trans_dicom_diannei_simpleitk
+from settings import SLICES_NEIGHBOR_DIST, C_BATCH_SIZE
+import shutil
+import sys
+import json
+import argparse
+import SimpleITK
+from scipy import ndimage
+from scipy.ndimage.measurements import center_of_mass
+from skimage import morphology
+from skimage.measure import label, regionprops
+#from image_util import logging
+import platform
+import subprocess
+from net_avm_2d import get_unet, prepare_image_for_net
+
+import log_util
+logging = log_util.get_logger('./ct_runtime.log')
+CUBE_IMGTYPE_SRC = "_i"
+
+# K.set_image_dim_ordering("tf")
+MEAN_PIXEL_VALUE_NODULE = 41
+CUBE_SIZE = 32
+MEAN_PIXEL_VALUE = MEAN_PIXEL_VALUE_NODULE
+NEGS_PER_POS = 20
+P_TH = 0.1
+THRESHOLD = 2
+PREDICT_STEP = 12
+USE_DROPOUT = False
+
+# BOX_size = 7
+# BOX_depth = 3
+# NODULE_CHANCE = 0.5
+NODULE_DIAMM = 1.0
+SEGMENTER_IMG_SIZE = 320
+
+#1.2.840.113619.2.416.175116877022943089867467728323180506130
+# DICOM_SPACING = []
+# DICOM_size = []
+
+
+def load_patient(src_dir):
+    files = os.listdir(src_dir)
+    slices = []
+    for s in files:
+        if is_dicom_file(src_dir + '/' + s):
+            instance = dicom.read_file(src_dir + '/' + s)
+            slices.append(instance)
+    slices.sort(key=lambda x: int(x.InstanceNumber))
+    try:
+        slice_thickness = numpy.abs(slices[0].ImagePositionPatient[2] - slices[1].ImagePositionPatient[2])
+    except:
+        slice_thickness = numpy.abs(slices[0].SliceLocation - slices[1].SliceLocation)
+
+    for s in slices:
+        s.SliceThickness = slice_thickness
+    return slices
+
+
+def get_pixels_hu(slices):
+    image = numpy.stack([s.pixel_array for s in slices])
+    image = image.astype(numpy.int16)
+    image[image == -2000] = 0
+    for slice_number in range(len(slices)):
+        intercept = slices[slice_number].RescaleIntercept
+        slope = slices[slice_number].RescaleSlope
+        if slope != 1:
+            image[slice_number] = slope * image[slice_number].astype(numpy.float64)
+            image[slice_number] = image[slice_number].astype(numpy.int16)
+        image[slice_number] += numpy.int16(intercept)
+
+    return numpy.array(image, dtype=numpy.int16)
+
+
+
+def extract_dicom_images_patient_simpleitk(dicom_path, only_patient_id, target_dir):
+    '''
+    :param dicom_path:
+    :param only_patient_id:
+    :param target_dir:
+    :return:
+    '''
+    patient_id = only_patient_id
+    print('dicom_path: ', dicom_path, ' patient_id: ', patient_id)
+    print("begin dicom load", time.asctime(time.localtime(time.time())))
+    try:
+        slices = load_patient(dicom_path)
+        print("dicom load complete", time.asctime(time.localtime(time.time())))
+        print(type(slices[0]), slices[0].ImagePositionPatient)
+        print(len(slices), "\t", slices[0].SliceThickness, "\t", slices[0].PixelSpacing)
+        print("Orientation: ", slices[0].ImageOrientationPatient)
+        assert slices[0].ImageOrientationPatient == [1.000000, 0.000000, 0.000000, 0.000000, 1.000000,
+                                                     0.000000]
+        invert_order = slices[1].ImagePositionPatient[2] > slices[0].ImagePositionPatient[2]
+        print("Invert order: ", invert_order, " - ", slices[1].ImagePositionPatient[2], ",",
+              slices[0].ImagePositionPatient[2])
+        pixel_spacing = slices[0].PixelSpacing
+        pixel_spacing.append(slices[0].SliceThickness)
+
+    except:
+        reader = SimpleITK.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(dicom_path)
+        slice1_image_position = 0.0
+        slice2_image_position = 0.0
+        slice1_location = 0.0
+        slice2_location = 0.0
+        pixel_spacing_str = ''
+        pixel_spacing = []
+        image_orientation_str = ''
+        ImageOrientationPatient = []
+        slice_thickness = 0.0
+        for slice_path in dicom_names:
+            slice = SimpleITK.ReadImage(slice_path)
+            # '0020|0013' denotes instance number
+            # '0020|0032' denotes image position
+            # '0028|0030' denotes pixel spacing
+            # '0020|0037' denotes image orientation
+            # '0020|1041' denotes slice location
+            pixel_spacing_str = slice.GetMetaData('0028|0030')
+            image_orientation_str = slice.GetMetaData('0020|0037')
+            if int(slice.GetMetaData('0020|0013')) == 1:
+                slice_1 = slice
+                slice1_image_position = float(slice_1.GetMetaData('0020|0032').split('\\')[2])
+                slice1_location = float(slice_1.GetMetaData('0020|1041'))
+                print(slice1_image_position)
+            elif int(slice.GetMetaData('0020|0013')) == 2:
+                slice_2 = slice
+                slice2_image_position = float(slice_2.GetMetaData('0020|0032').split('\\')[2])
+                slice2_location = float(slice_2.GetMetaData('0020|1041'))
+                print(slice2_image_position)
+        # Get invert order
+        invert_order = slice2_image_position > slice1_image_position
+        print('invert_order is: ' + str(invert_order))
+        # Get pixel_spacing
+        for i in pixel_spacing_str.split('\\'):
+            pixel_spacing.append(i)
+        print(pixel_spacing)
+
+        # Get image orientation
+        for i in image_orientation_str.split('\\'):
+            i = round(float(i), 6)
+            ImageOrientationPatient.append(i)
+        print(ImageOrientationPatient)
+        assert ImageOrientationPatient == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        # Get thickness
+        try:
+            slice_thickness = numpy.abs(slice1_image_position - slice2_image_position)
+        except:
+            slice_thickness = numpy.abs(slice1_location - slice2_location)
+        pixel_spacing.append(slice_thickness)
+
+    print("get hu", time.asctime(time.localtime(time.time())))
+    pixels = get_pixels_hu_by_simpleitk(dicom_path)
+    print("get hu complete", time.asctime(time.localtime(time.time())))
+    image = pixels
+    print(image.shape)
+
+    # save dicom source image size
+    dicom_size = [image.shape[0], image.shape[1], image.shape[2]]
+    print("begin img resize", time.asctime(time.localtime(time.time())))
+    image = helpers.rescale_patient_images(image, pixel_spacing, settings.TARGET_VOXEL_MM)
+    print("img resize complete", time.asctime(time.localtime(time.time())))
+    png_size = [image.shape[0], image.shape[1], image.shape[2]]
+    if not invert_order:
+        image = numpy.flipud(image)
+
+    # clean png in dir
+    patient_dir = target_dir + "/png"
+    if not os.path.exists(patient_dir):
+        os.mkdir(patient_dir)
+    else:
+        print("png dir already exists, return directly")
+        return pixel_spacing, dicom_size, png_size, invert_order
+    png_files = glob.glob(patient_dir + "*.png")
+    for file in png_files:
+        os.remove(file)
+    for i in tqdm(range(image.shape[0])):
+        img_path = patient_dir + "/img_" + str(i).rjust(4, '0') + "_i.png"
+        org_img = image[i]
+        img, mask = helpers.get_segmented_lungs(org_img.copy())
+        org_img = helpers.normalize_hu(org_img)
+        cv2.imwrite(img_path, org_img * 255)
+        cv2.imwrite(img_path.replace("_i.png", "_m.png"), mask * 255)
+
+    return pixel_spacing, dicom_size, png_size, invert_order
+
+
+def prepare_image_for_net3D(img):
+    img = img.astype(numpy.float32)
+    img -= MEAN_PIXEL_VALUE
+    img /= 255.
+    img = img.reshape(1, img.shape[0], img.shape[1], img.shape[2], 1)
+    return img
+
+
+def load_patient_images(src_dir, wildcard="*.*", exclude_wildcards=[]):
+    src_img_paths = glob.glob(src_dir + wildcard)
+    for exclude_wildcard in exclude_wildcards:
+        exclude_img_paths = glob.glob(src_dir + exclude_wildcard)
+        src_img_paths = [im for im in src_img_paths if im not in exclude_img_paths]
+    src_img_paths.sort()
+    images = [cv2.imread(img_path, cv2.IMREAD_GRAYSCALE) for img_path in src_img_paths]
+    images = [im.reshape((1,) + im.shape) for im in images]
+    res = numpy.vstack(images)
+    return res
+
+
+def get_papaya_coords(coord_x, coord_y, coord_z, pixel_spacing, dicom_size, png_size, invert_order,
+                      ggn_class, special_code, d3_resize, BOX_size):
+    # z = int(round(coord_z * png_size[0]))
+    y = int(round(coord_y * png_size[1]))
+    x = int(round(coord_x * png_size[2]))
+    dicom_z = coord_z  # unet coord_z is a int number, the same with dicom_z
+    if d3_resize:
+        dicom_y = int(round(y / pixel_spacing[1]))
+    else:
+        dicom_y = y
+    if d3_resize:
+        dicom_x = int(round(x / pixel_spacing[0]))
+    else:
+        dicom_x = x
+    # print("invert_order:", invert_order)
+    if invert_order:
+        print('If invert_order is true!')
+        new_z = dicom_z
+        new_x = dicom_size[2] - dicom_x
+        new_y = dicom_y
+
+    else:
+        print('If invert_order is false!')
+        new_z = dicom_z
+        new_x = dicom_size[2] - dicom_x
+        new_y = dicom_y
+
+    print("invert_order: ", invert_order, "new_coord_z_y_x: ", new_z, new_y, new_x, " dicom_coord_z_y_x: ", dicom_z,
+          dicom_y, dicom_x)
+
+    x1 = new_x - BOX_size[0]
+    y1 = new_y - BOX_size[0]
+    x2 = new_x + BOX_size[0]
+    y2 = new_y + BOX_size[0]
+    if BOX_size[1] >= new_z:
+        z1 = 1.0
+    else:
+        z1 = new_z - BOX_size[1]
+    if new_z + BOX_size[1] > dicom_size[0]:
+        z2 = dicom_size[0]
+    else:
+        z2 = new_z + BOX_size[1]
+    # box = [z1, y1, x1, z2, y2, x2]
+    # center = [new_z, new_y, new_x, ggn_class[0], ggn_class[1] * 100, ggn_class[2],
+    #           ggn_class[3] * 100]
+    box = [x1, y1, z1, x2, y2, z2]
+    center = [new_x, new_y, new_z, ggn_class[0], ggn_class[1] * 100, ggn_class[2],
+              ggn_class[3] * 100]
+    return box, center
+
+
+def reduce_unet_cans(workspace, centers, spacing, image_shape, dicom_shape, invert_order, special_code,
+                     d3_resize):
+    list = []
+    web_boxes = []
+    web_centers = []
+    cans_centers_precent = []
+    reduced_centers_precent = []
+    if len(centers) == 0:
+        return web_boxes, web_centers
+    # reduce centers
+
+    new_dir = workspace + '/png/'
+    images = load_patient_images(new_dir, "*" + CUBE_IMGTYPE_SRC + ".png")
+
+    j = 0
+    for center in centers:
+
+        center = center[0]
+
+        unet_z = center[2]
+        unet_y = center[1]
+        unet_x = center[0]
+        if d3_resize:
+            z = int(round(center[2] * spacing[2]))
+        else:
+            z = unet_z
+        if d3_resize:
+            y = int(round((center[1]) * spacing[1]))
+        else:
+            y = unet_y
+        if d3_resize:
+            x = int(round((center[0]) * spacing[0]))
+        else:
+            x = unet_x
+        cans_centers_precent.append([x / image_shape[2], y / image_shape[1], z / image_shape[0],
+                                     center[2]])  # keep unet coord_z for web dicom display
+        # print("png_resized-x-y-z:", x, y, z)
+        cube_img = get_cube_from_img(images, x, y, z, 32)
+        # save_cube_img('./' + png_dir + '/_' + str(i) + '.png', cube_img, 4, 8)
+        print('x_y_z', unet_x, unet_y, unet_z)
+        cv2.circle(images[z], (x, y), 10, (255, 0, 0), 1)
+
+        cv2.imwrite(workspace + '/' + str(j) + '_unet_cans_z_y_x_' + str(unet_z) + '_' + str(unet_y) + '_' + str(
+            unet_x) + '_.png',
+                    images[z])
+        # save_cube_img(workspace + '/_' + str(x) + '_' + str(y) + '_' + str(z) + '.png', cube_img, 4, 8)
+        img3d = prepare_image_for_net3D(cube_img)
+        list.append(img3d)
+        j += 1
+
+    cans_npy = numpy.vstack(list)
+
+    reduced_list = []
+    prob_list = []
+    for j in range(len(cans_npy)):
+        reduced_centers_precent.append(cans_centers_precent[j])  # ?????????
+        reduced_list.append(cans_npy[j])
+
+    # loaded_model = get_model_cm('./models/cm.json', './models/cm.hd5')
+    loaded_model=get_model('./models/my_model_cm.h5')
+    loaded_model.summary()
+    mali_result = loaded_model.predict(cans_npy, batch_size=C_BATCH_SIZE, verbose=1)
+
+    # class_model = get_model_cb('./models/cb.json', './models/cb.hd5')
+    class_model=get_model('./models/my_model_cb.h5')
+    class_model.summary()
+    class_result = class_model.predict(cans_npy, batch_size=C_BATCH_SIZE, verbose=1)
+
+    # print('done')
+    # merge result
+    images_ori = load_patient_images(new_dir, "*" + CUBE_IMGTYPE_SRC + ".png")
+    j = 0
+    for (c_percent, center) in zip(reduced_centers_precent, centers):
+
+        BOX_size = center[1]
+
+        # save result cubes
+        x, y, z = c_percent[0], c_percent[1], c_percent[2]
+        x, y, z = x * image_shape[2], y * image_shape[1], z * image_shape[0]
+        cube_img = get_cube_from_img(images_ori, x, y, z, 64)
+        save_cube_img(workspace + '/' + str(j) + '_cube_z_' + str(c_percent[3]) + '_p_' + '_.png', cube_img, 8, 8)
+        # handle papaya coord
+        ii_index = numpy.argmax(class_result[j])
+        if (mali_result[j][0] >= 0.6):
+            mali_type = [1, mali_result[j][0], ii_index, class_result[j][ii_index]]
+        else:
+            mali_type = [0, mali_result[j][0], ii_index, class_result[j][ii_index]]
+        print("index-x-y-z-p", c_percent[0], c_percent[1], c_percent[2])
+        box, center = get_papaya_coords(c_percent[0], c_percent[1], c_percent[3], spacing, dicom_shape,
+                                        image_shape, invert_order, mali_type, special_code, d3_resize, BOX_size)
+
+        web_boxes.append(box)
+        web_centers.append(center)
+
+        j += 1
+
+    return web_boxes, web_centers
+
+
+def save_cube_img(target_path, cube_img, rows, cols):
+    assert rows * cols == cube_img.shape[0]
+    img_height = cube_img.shape[1]
+    img_width = cube_img.shape[1]
+    res_img = numpy.zeros((rows * img_height, cols * img_width), dtype=numpy.uint8)
+
+    for row in range(rows):
+        for col in range(cols):
+            target_y = row * img_height
+            target_x = col * img_width
+            res_img[target_y:target_y + img_height, target_x:target_x + img_width] = cube_img[row * cols + col]
+
+    cv2.imwrite(target_path, res_img)
+
+
+def get_cube_from_img(img3d, center_x, center_y, center_z, block_size):
+    start_x = max(center_x - block_size / 2, 0)
+    if start_x + block_size > img3d.shape[2]:
+        start_x = img3d.shape[2] - block_size
+
+    start_y = max(center_y - block_size / 2, 0)
+    # add new codes to determine whether cube over the y-axis border
+    if start_y + block_size > img3d.shape[1]:
+        start_y = img3d.shape[1] - block_size
+    start_z = max(center_z - block_size / 2, 0)
+    if start_z + block_size > img3d.shape[0]:
+        start_z = img3d.shape[0] - block_size
+    start_z = int(start_z)
+    start_y = int(start_y)
+    start_x = int(start_x)
+    res = img3d[start_z:start_z + block_size, start_y:start_y + block_size, start_x:start_x + block_size]
+    return res
+
+
+def get_distance(point1, point2):
+    # points order : z_y_x
+    dist = math.sqrt(math.pow(point1[2] - point2[2], 2) + math.pow(point1[1] - point2[1], 2)
+                     + math.pow(point1[0] - point2[0], 2))
+    return dist
+
+
+def get_distance_2d(point1, point2):
+    # points order : y_x
+    # print('p1--p2: ', point1[1], point2[1], point1[2], point2[2])
+    dist = math.sqrt(math.pow(point1[1] - point2[1], 2)
+                     + math.pow(point1[2] - point2[2], 2))
+    # print('dist: ', dist)
+    return dist
+
+
+def fuse(points, d):
+    ret = []
+    d2 = d
+    n = len(points)
+    taken = [False] * n
+    for i in range(n):
+        if not taken[i]:
+            count = 1
+            point = [points[i][0], points[i][1], points[i][2]]
+            taken[i] = True
+            for j in range(i + 1, n):
+                if get_distance(points[i], points[j]) < d2:
+                    point[0] = points[i][0]
+                    point[1] = points[i][1]
+                    point[2] = points[i][2]
+                    # count += 1
+                    taken[j] = True
+            # point[0] /= count
+            # point[1] /= count
+            # point[2] /= count
+            ret.append((int(round(point[0])), int(round(point[1])), int(round(point[2]))))
+    return ret
+
+
+def fuse_group(points, d):
+    ret = []
+    d2 = d
+    n = len(points)
+    taken = [False] * n
+    for i in range(n):
+        if not taken[i]:
+            point = [points[i][0], points[i][1], points[i][2]]
+            grp = []
+            grp.append(point)
+            taken[i] = True
+            for j in range(i + 1, n):
+                if get_distance(points[i], points[j]) < d2:
+                    taken[j] = True
+                    grp.append([points[j][0], points[j][1], points[j][2]])
+                else:
+                    ret.append(grp)
+                    grp = []
+                    break
+    if len(grp) > 0:
+        ret.append(grp)
+
+    return ret
+
+
+def merge_group(grp_list):
+    ret = []
+    # d2 = d
+    n = len(grp_list)
+    # taken = [False] * n
+    for i in range(n):
+        num = len(grp_list[i])
+        print('num:', num)
+        if (num >= 3):
+            index = int(round(num / 2))
+            print("index:", index)
+            ret.append(grp_list[i][index - 1])
+        else:
+            ret.append(grp_list[i][0])
+
+    return ret
+
+
+def merge_grp_center(points, d, grp_list):
+    ret = []
+    d2 = d
+    n = len(points)
+    taken = [False] * n
+    for i in range(n):
+        if not taken[i]:
+            point = [points[i][0], points[i][1], points[i][2]]
+            grp = []
+            grp.append(point)
+            taken[i] = True
+            for j in range(i + 1, n):
+                if get_distance(points[i], points[j]) < d2:
+                    taken[j] = True
+                    grp.append([points[j][0], points[j][1], points[j][2]])
+                else:
+                    ret.append(grp)
+                    grp = []
+                    break
+    if len(grp) > 0:
+        ret.append(grp)
+
+    return ret
+
+
+def fuse_by_neighbor(points, d):
+    ret = []
+    d2 = d
+    n = len(points)
+    taken = [False] * n
+    for i in range(n):
+        if not taken[i]:
+            point = [points[i][0], points[i][1], points[i][2]]
+            grp = []
+            grp.append(point)
+            taken[i] = True
+            for j in range(i + 1, n):
+                if j <= n - 1:
+                    if taken[j]:
+                        continue
+                    # print('j,j+1', j, j+1, ': ', points[j][0], points[j+1][0])
+                    # print('j-1,j', j-1, j, ': ', points[j-1][0], points[j][0])
+                    slices_dist = points[j][0] - points[j - 1][0]
+                    # print('slices_dist: ', slices_dist)
+                    # if slices_dist == 0:
+                    #     continue
+                    if get_distance_2d(points[i], points[j]) <= d2 and slices_dist <= SLICES_NEIGHBOR_DIST:
+                        taken[j] = True
+                        grp.append([points[j][0], points[j][1], points[j][2]])
+
+            ret.append(grp)
+            # grp = []
+            # print('i: ', i)
+
+    # if len(grp) > 0:
+    #     ret.append(grp)
+
+    return ret
+
+
+def check_nodules_num(path):
+    '''
+    Get the coordinates and diameter from json
+    :param path:
+    :return:
+    '''
+    centers = []
+    with open(path) as json_data:
+        d = json.load(json_data)
+        nodules_num = d['nodule_info']
+    json_data.close()
+
+    return len(nodules_num)
+
+
+
+def get_centers(path, provider):
+    '''
+    Get the coordinates and diameter from json
+    :param path:
+    :return:
+    '''
+    centers = []
+    with open(path) as json_data:
+        d = json.load(json_data)
+        for nodule in d['nodule_info']:
+            x = nodule['coordX']
+            y = nodule['coordY']
+            if provider == 'huayuan':
+                z = nodule['coordZ']
+            if provider == 'diannei':
+                z = d['Dcm_series_size'][2] - nodule['coordZ'] - 1
+            diameter = nodule['diameter']
+            diameter, y_diamemter = get_x_y_diamemter(diameter)
+            radius = float(diameter) / 2
+            # Convert the mm of to pixel
+            BOX_xy = round(radius / d['Dcm_series_spacing'][0])
+            # BOX_z = round(radius / d['Dcm_series_spacing'][2])
+            if BOX_xy < 12:
+                print('box_xy < 12')
+                BOX_size = (int(BOX_xy*1.2), int(BOX_xy / d['Dcm_series_spacing'][2]))
+            if BOX_xy <= 5:
+                print('box_xy <=5')
+                BOX_size = (7, int(7 / d['Dcm_series_spacing'][2]))
+            else:
+                print('box_xy other wise')
+                BOX_size = (int(BOX_xy*1.2), int(12 / d['Dcm_series_spacing'][2]))
+            centers.append(((x, y, z), BOX_size))
+    json_data.close()
+    return centers
+
+def get_seriesid(path):
+
+    with open(path) as json_data:
+        d = json.load(json_data)
+        series_uid = d['series_uid']
+        study_uid = d['study_uid']
+    json_data.close()
+    print('series_uid', series_uid)
+    print('study_uid', study_uid)
+
+    return series_uid, study_uid
+
+
+def get_x_y_diamemter(diameter):
+    strs = diameter.split('*')
+    x_diamemter = strs[0].strip("mm")
+    y_diamemter = strs[1].strip("mm")
+    return x_diamemter, y_diamemter
+
+
+def extract_dicom(path):
+    '''
+    :param path:
+    :return:
+    '''
+    patients = os.listdir(path)
+    patient_dicom_fullPath_list = []
+    for patient in patients:
+        patient_dicom_fullPath_list.append((os.path.join(path, patient), patient))
+    # print(patient_dicom_fullPath_list)
+    return patient_dicom_fullPath_list
+
+
+def write_json2(web_box, web_centers, json1_path, json2_path, dicom_dir, web_display):
+    '''
+    :param web_centers:
+    :param json2_path:
+    :return:
+    '''
+    class_list = ['AAH', 'AIS', 'MIA', 'IA', 'OTHER']
+    box = []
+    with open(json1_path, 'r') as json_data:
+        d = json.load(json_data)
+        for (web_box_1, web_center, nodule) in zip(web_box, web_centers, d['nodule_info']):
+            if web_display == '1':
+                nodule['coordX'] = web_center[0]
+                nodule['coordY'] = web_center[1]
+                nodule['coordZ'] = web_center[2]
+            lb = {}
+            ub = {}
+            if web_display == '1':
+                lb['x'] = web_box_1[0]
+                lb['y'] = web_box_1[1]
+                lb['z'] = web_box_1[2]
+                ub['x'] = web_box_1[3]
+                ub['y'] = web_box_1[4]
+                ub['z'] = web_box_1[5]
+            box.append({'lb': lb, 'ub': ub})
+            malignant = round(web_center[4] / 100, 2)
+            invision_classify = class_list[web_center[5]]
+            invision_classify_probe = round(web_center[6] / 100, 2)
+            nodule['maligant'] = malignant
+            nodule['invision_classify'] = invision_classify
+            nodule['invision_classify_probe'] = invision_classify_probe
+            print(web_center)
+    json_data.close()
+
+    d['box'] = box
+
+    dicom_path = dicom_dir
+    print('-------------dicom_path: ' + dicom_path)
+    start_point = [web_centers[0][0], web_centers[0][1], web_centers[0][2]]
+    print('-------------start_point: ' + str(start_point))
+    d['dicom_path'] = dicom_path
+    d['start_point'] = start_point
+
+    with open(json2_path, 'w') as f:
+        json_dict = json.dumps(d, sort_keys=True, indent=4, separators=(',', ': '))
+        f.write(json_dict)
+    f.close()
+
+
+
+def write_json2_without_nodules(json1_path, json2_path, dicom_dir):
+    '''
+    :param web_centers:
+    :param json2_path:
+    :return:
+    '''
+    box = []
+    with open(json1_path, 'r') as json_data:
+        d = json.load(json_data)
+    json_data.close()
+
+    d['box'] = box
+
+    dicom_path = dicom_dir
+    print('-------------dicom_path: ' + dicom_path)
+    start_point = []
+    print('-------------start_point: ' + str(start_point))
+    d['dicom_path'] = dicom_path
+    d['start_point'] = start_point
+
+    with open(json2_path, 'w') as f:
+        json_dict = json.dumps(d, sort_keys=True, indent=4, separators=(',', ': '))
+        f.write(json_dict)
+    f.close()
+
+
+def draw_mask(bg, mask):
+
+    backtorgb = cv2.cvtColor(bg, cv2.COLOR_GRAY2RGB)
+    # cv2.imwrite('./out.png', backtorgb)
+
+    mask = (mask >= 200)
+    # print(mask)
+    roi = backtorgb
+    roi = roi[mask]
+    # print(roi.shape)
+    c = '0,0,255'
+    COLORS = numpy.array(c.split(",")).astype("int")
+    COLORS = numpy.array(COLORS, dtype="uint8")
+    # color = (0,255,0)
+    blended = ((0.2 * COLORS) + (0.8 * roi)).astype("uint8")
+    # print(blended)
+    backtorgb[mask] = blended
+    # cv2.imwrite('./out.png', backtorgb)
+    return backtorgb
+
+
+def group_consecutives(vals, step=1):
+    """Return list of consecutive lists of numbers from vals (number list)."""
+    run = []
+    result = [run]
+    expect = None
+    for v in vals:
+        if (v == expect) or (expect is None):
+            run.append(v)
+        else:
+            run = [v]
+            result.append(run)
+        expect = v + step
+    return result
+
+
+
+def unet_candidate_dicom(workspace):
+    cands = sorted(glob.glob(workspace + '/*_m.png'))
+    centers = {}
+    z_array = []
+
+    for name in cands:
+        z_px = name.split('_')[-2]
+        # image = imread(name)
+        image_t = cv2.imread(name, cv2.IMREAD_GRAYSCALE)
+        # Thresholding
+        image_t[image_t < THRESHOLD] = 0
+        image_t[image_t > 0] = 1
+        # dilation
+        selem = morphology.disk(1)
+        image_eroded = morphology.binary_closing(image_t, selem=selem)
+        # label_im, nb_labels = ndimage.label(image_eroded)
+        label_im = label(image_eroded)
+        props = regionprops(label_im)
+        if len(props) > 1:
+            # print(cube_path, ' len of props: ', len(props))
+            props.sort(key=lambda r: r['area'], reverse=True)
+        if len(props) > 0:
+            prop = props[0]
+            centroid = prop['centroid']
+            bbox_list = prop['bbox']
+            # print(bbox_list)
+            diameter_y = bbox_list[2] - bbox_list[0]
+            # print(centroid)
+            center_y, center_x = int(centroid[0]), int(centroid[1])
+            # print(int(z_px), center_x, center_y)
+            centers[int(z_px)] = (center_y, center_x, diameter_y)
+            z_array.append(int(z_px))
+
+
+
+    z_array = group_consecutives(z_array, 1)
+    z_array.sort(key=lambda x:len(x), reverse=True)
+    real_center_z = 0
+    result = (0, 0 ,0)
+
+    if len(z_array) > 0:
+        real_center_index = int(len(z_array[0]) / 2)
+        real_center_z = z_array[0][real_center_index]
+        if real_center_z in centers:
+            result = centers[real_center_z]
+
+    return real_center_z, result[0], result[1], result[2]
+
+
+# horos_5358
+if __name__ == "__main__":
+    # logging = log_util.get_logger('./mali_invasion_predict.log')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--series_path')
+    # parser.add_argument('--json1_path')
+    # parser.add_argument('--json1_filename')
+    parser.add_argument('--json2_path')
+    parser.add_argument('--json2_filename')
+    # parser.add_argument('--provider')
+    # parser.add_argument('--multidicom')
+    # parser.add_argument('--web_display')
+    args = parser.parse_args()
+    series_path = args.series_path
+    jons2_path = args.json2_path
+    json2_filename = args.json2_filename
+    json2 = os.path.join(jons2_path, json2_filename)
+
+    spacing, image_shape, dicom_shape, invert_order, special_code, d3_resize = trans_dicom_avm(series_path)
+
+    model = get_unet(0.0001)
+    model.load_weights('./u-net_42--0.70.hd5')
+    input_path = './work_dir/png/'
+    img_files_path = sorted(glob.glob(input_path + '*_i.png'))
+    images = []
+    origin_img = []
+    for file in img_files_path:
+        # print(file)
+        img = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
+        origin_img.append(img)
+        input_shape = img.shape[0]
+        # do img resize to 320
+        img = cv2.resize(img, dsize=(SEGMENTER_IMG_SIZE, SEGMENTER_IMG_SIZE), interpolation=cv2.INTER_NEAREST)
+
+        img = prepare_image_for_net(img)
+        images.append(img)
+
+
+    images3d = numpy.vstack(images)
+    # images3d = images3d.swapaxes(0, 3)
+    print(images3d.shape)
+    y_pred = model.predict(images3d, batch_size=8)
+    print(len(y_pred))
+    count = 0
+    for y in y_pred:
+        y *= 255.
+        y = y.reshape((y.shape[0], y.shape[1])).astype(numpy.uint8)
+        y = cv2.resize(y, dsize=(input_shape, input_shape), interpolation=cv2.INTER_NEAREST)
+
+
+        if platform.system() == 'Windows':
+            imgname = img_files_path[count].split('\\')[-1]
+            imgname_p = imgname.replace("_i.png", "_p.png")
+            imgname_m = imgname.replace("_i.png", "_m.png")
+        else:
+            imgname = img_files_path[count].split('/')[-1]
+            imgname_p = imgname.replace("_i.png", "_p.png")
+            imgname_m = imgname.replace("_i.png", "_m.png")
+        overlay = draw_mask(origin_img[count], y)
+        cv2.imwrite(input_path + imgname_p, overlay)
+        cv2.imwrite(input_path + imgname_m, y)
+        count += 1
+
+    center_z, center_y, center_x, diameter_y = unet_candidate_dicom('./work_dir/png')
+
+    dicom_dict = {}
+    avm_list = []
+    avm = {}
+    avm["center_hu"] = 0
+    avm["coordX"] = center_x
+    avm["coordY"] = center_y
+    avm["coordZ"] = center_z
+    avm["diameter"] = '0'
+    avm["diameter_x"] = diameter_y
+    avm["diameter_y"] = diameter_y
+    avm["diameter_z"] = diameter_y
+    avm["invision_classify"] = '0'
+    avm["invision_classify_probe"] = 0
+    avm["loc"] = '0'
+    avm["loc_small"] = '0'
+    avm["maligant"] = 0
+    avm["mean_hu"] = 0
+    avm["nodule_size"] = 0
+    avm["probability"] = 0
+    avm_list.append(avm)
+    dicom_dict['nodule_info'] = avm_list
+    # json.dumps(dicom_dict, sort_keys=True, indent=4)
+    with open(json2, 'w') as f:
+        json_dict = json.dumps(dicom_dict, sort_keys=True, indent=4, separators=(',', ': '))
+        f.write(json_dict)
+    f.close()
+
+
+
